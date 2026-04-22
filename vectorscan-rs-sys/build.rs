@@ -20,23 +20,62 @@ fn main() {
         .into_string()
         .unwrap();
 
-    // Choose appropriate C++ runtime library
+    // Choose appropriate C++ runtime library based on the target.
+    // Probing the host `c++` is wrong when cross-compiling (e.g. macOS clang -> Windows
+    // MinGW); pick from TARGET first and only fall back to host probing for Unix hosts.
+    //
+    // Order matters here: c++ depends on c++abi, which depends on unwind. Static linking
+    // requires emitting the dependencies after their dependents.
     {
-        let compiler_version_out = String::from_utf8(
-            Command::new("c++")
-                .args(["-v"])
+        let target = env("TARGET");
+        if target.contains("windows-gnullvm") {
+            // llvm-mingw: clang + libc++ + libc++abi + libunwind. Statically link all three
+            // so the resulting binary has no libc++.dll / libunwind.dll runtime dependency.
+            //
+            // We can't use `rustc-link-arg` here — it's silently dropped for library crates.
+            // Instead, ask clang where the static archives live and emit a search path plus
+            // `link-lib=static=`, which rustc honors for all downstream artifacts.
+            // Match the `cc` crate's precedence: target-specific CXX_<target> wins over
+            // a generic CXX, which would otherwise be wrong on hosts that set CXX=g++
+            // globally (common on Ubuntu via direnv/CI).
+            let cxx = std::env::var(format!("CXX_{}", target.replace('-', "_")))
+                .or_else(|_| std::env::var("CXX"))
+                .unwrap_or_else(|_| "clang++".to_string());
+            let path = Command::new(&cxx)
+                .arg("--print-file-name=libc++.a")
                 .output()
-                .expect("Failed to get C++ compiler version")
-                .stderr,
-        )
-        .unwrap();
-
-        if compiler_version_out.contains("gcc") {
+                .ok()
+                .and_then(|o| String::from_utf8(o.stdout).ok())
+                .map(|s| s.trim().to_string())
+                .unwrap_or_default();
+            if let Some(dir) = PathBuf::from(&path).parent() {
+                if !dir.as_os_str().is_empty() {
+                    println!("cargo:rustc-link-search=native={}", dir.display());
+                }
+            }
+            println!("cargo:rustc-link-lib=static=c++");
+            println!("cargo:rustc-link-lib=static=c++abi");
+            println!("cargo:rustc-link-lib=static=unwind");
+        } else if target.contains("windows-gnu") {
             println!("cargo:rustc-link-lib=stdc++");
-        } else if compiler_version_out.contains("clang") {
+        } else if target.contains("windows-msvc") {
+            // MSVC links the C++ runtime implicitly via /MD or /MT.
+        } else if target.contains("apple") {
             println!("cargo:rustc-link-lib=c++");
         } else {
-            panic!("No compatible compiler found: either clang or gcc is needed");
+            let flavor = Command::new("c++")
+                .args(["-v"])
+                .output()
+                .ok()
+                .map(|o| String::from_utf8_lossy(&o.stderr).into_owned())
+                .unwrap_or_default();
+            if flavor.contains("clang") {
+                println!("cargo:rustc-link-lib=c++");
+            } else if flavor.contains("gcc") {
+                println!("cargo:rustc-link-lib=stdc++");
+            } else {
+                panic!("No compatible compiler found: either clang or gcc is needed");
+            }
         }
     }
 
