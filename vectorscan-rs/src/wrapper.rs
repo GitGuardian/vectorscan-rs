@@ -148,6 +148,24 @@ impl Database {
         }
     }
 
+    /// Deserializes a database from a borrowed byte slice.
+    ///
+    /// `hs_deserialize_database` copies the serialized data into its own allocation,
+    /// so the input buffer does not need to outlive the call. This makes the method
+    /// safe to use with `include_bytes!`-embedded databases.
+    pub fn deserialize_from_bytes(bytes: &[u8]) -> Result<Self, Error> {
+        let mut db_ptr = MaybeUninit::zeroed();
+        unsafe {
+            hs::hs_deserialize_database(
+                bytes.as_ptr() as *const std::os::raw::c_char,
+                bytes.len(),
+                db_ptr.as_mut_ptr(),
+            )
+            .ok()
+            .map(|()| Database::from_ptr(db_ptr.assume_init()))
+        }
+    }
+
     /// Gets the size of the database in bytes using `hs_database_size`.
     pub fn size(&self) -> Result<usize, Error> {
         let mut database_size = MaybeUninit::zeroed();
@@ -186,6 +204,17 @@ impl SerializedDatabase {
     #[inline]
     pub fn deserialize(self) -> Result<Database, Error> {
         Database::deserialize(self)
+    }
+
+    /// Returns the serialized database as a borrowed byte slice.
+    ///
+    /// The slice is tied to `self`'s lifetime — the backing C allocation is freed
+    /// when `SerializedDatabase` is dropped.
+    pub fn as_bytes(&self) -> &[u8] {
+        // SAFETY: `bytes` is a pointer returned by `hs_serialize_database` and valid
+        // for `length` bytes until `Drop` frees it. The returned slice borrows `self`,
+        // preventing use-after-free.
+        unsafe { std::slice::from_raw_parts(self.bytes as *const u8, self.length) }
     }
 
     /// Gets the size in bytes required to deserialize this database using

@@ -34,6 +34,29 @@ impl SharedBlockDatabase {
     pub fn size(&self) -> Result<usize, Error> {
         self.inner.size()
     }
+
+    /// Serialize the compiled database into an owned byte buffer suitable for
+    /// writing to disk or embedding via `include_bytes!`.
+    ///
+    /// The returned bytes are portable across processes on the same CPU/platform
+    /// but are NOT guaranteed to be portable across CPU feature levels.
+    pub fn serialize(&self) -> Result<Vec<u8>, Error> {
+        let sdb = self.inner.serialize()?;
+        // Copy out of the C-allocated buffer so the caller owns the memory;
+        // `sdb` is dropped at end of scope, freeing the C allocation.
+        Ok(sdb.as_bytes().to_vec())
+    }
+
+    /// Reconstruct a database from a byte slice previously produced by `serialize`.
+    ///
+    /// Hyperscan copies the serialized data internally, so `bytes` does not need
+    /// to outlive the call — safe to pass an `include_bytes!` static slice.
+    pub fn deserialize(bytes: &[u8]) -> Result<Self, Error> {
+        let inner = wrapper::Database::deserialize_from_bytes(bytes)?;
+        Ok(Self {
+            inner: Arc::new(inner),
+        })
+    }
 }
 
 /// A block-mode scanner that owns its scratch space and an [`Arc`] reference to the database.
@@ -187,6 +210,54 @@ mod tests {
         let patterns = vec![Pattern::new(b"hello".to_vec(), Flag::default(), None)];
         let db = SharedBlockDatabase::new(patterns)?;
         assert_eq!(db.size()?, 1000); // N.B. this value may change if the vectorscan code changes
+        Ok(())
+    }
+
+    #[test]
+    fn serialize_roundtrip() -> Result<(), Error> {
+        let patterns = vec![
+            Pattern::new(b"hello".to_vec(), Flag::default(), None),
+            Pattern::new(b"world".to_vec(), Flag::default(), Some(42)),
+        ];
+        let db = SharedBlockDatabase::new(patterns)?;
+
+        let bytes = db.serialize()?;
+        assert!(!bytes.is_empty());
+
+        // Drop original to prove deserialize produces an independent database.
+        drop(db);
+
+        let db2 = SharedBlockDatabase::deserialize(&bytes)?;
+        let mut scanner = db2.create_scanner()?;
+
+        let mut matches = Vec::new();
+        scanner.scan(b"hello world", |id, from, to, flags| {
+            matches.push((id, from, to, flags));
+            Scan::Continue
+        })?;
+        assert_eq!(matches.as_slice(), &[(0, 0, 5, 0), (42, 0, 11, 0)]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn deserialize_from_borrowed_slice_after_buffer_reuse() -> Result<(), Error> {
+        // Verifies hyperscan copies the serialized data internally: after deserialize,
+        // we mutate the input buffer and confirm the resulting database still scans correctly.
+        let patterns = vec![Pattern::new(b"needle".to_vec(), Flag::default(), None)];
+        let mut bytes = SharedBlockDatabase::new(patterns)?.serialize()?;
+
+        let db = SharedBlockDatabase::deserialize(&bytes)?;
+        bytes.iter_mut().for_each(|b| *b = 0);
+
+        let mut scanner = db.create_scanner()?;
+        let mut hits = 0;
+        scanner.scan(b"find the needle in the haystack", |_, _, _, _| {
+            hits += 1;
+            Scan::Continue
+        })?;
+        assert_eq!(hits, 1);
+
         Ok(())
     }
 }
