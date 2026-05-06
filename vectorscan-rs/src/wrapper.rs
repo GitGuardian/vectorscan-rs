@@ -1,6 +1,7 @@
 use crate::error::{AsResult, Error};
 use bitflags::bitflags;
 use foreign_types::{foreign_type, ForeignType};
+use std::ffi::c_ulonglong;
 use std::{ffi::CString, mem::MaybeUninit, ptr};
 use vectorscan_rs_sys as hs;
 
@@ -81,6 +82,21 @@ impl Pattern {
 
 impl Database {
     pub fn new(patterns: Vec<Pattern>, mode: ScanMode) -> Result<Self, Error> {
+        Self::new_with_platform(patterns, mode, None)
+    }
+
+    /// Compile patterns targeting a specific [`Platform`].
+    ///
+    /// Passing `None` uses Hyperscan's default behaviour (the build host's CPU
+    /// features are populated via `hs_populate_platform()`), producing a
+    /// database that may not deserialize on a CPU with fewer features.
+    /// Passing `Some(&Platform::generic())` produces a portable database that
+    /// runs on any CPU supporting Hyperscan's baseline ISA.
+    pub fn new_with_platform(
+        patterns: Vec<Pattern>,
+        mode: ScanMode,
+        platform: Option<&Platform>,
+    ) -> Result<Self, Error> {
         let mut c_exprs = Vec::with_capacity(patterns.len());
         let mut c_flags = Vec::with_capacity(patterns.len());
         let mut c_ids = Vec::with_capacity(patterns.len());
@@ -94,6 +110,10 @@ impl Database {
             c_flags.push(flags.bits());
             c_ids.push(id.unwrap_or(0));
         }
+
+        let platform_ptr = platform
+            .map(|p| &p.inner as *const hs::hs_platform_info_t)
+            .unwrap_or(ptr::null());
 
         let mut db = MaybeUninit::zeroed();
         let mut err = MaybeUninit::zeroed();
@@ -109,7 +129,7 @@ impl Database {
                 ptr::null(),
                 c_exprs.len() as u32,
                 mode.bits(),
-                ptr::null(),
+                platform_ptr,
                 db.as_mut_ptr(),
                 err.as_mut_ptr(),
             )
@@ -297,5 +317,116 @@ bitflags! {
         const SOM_SMALL = hs::HS_MODE_SOM_HORIZON_SMALL;
         const SOM_MEDIUM = hs::HS_MODE_SOM_HORIZON_MEDIUM;
         const SOM_LARGE = hs::HS_MODE_SOM_HORIZON_LARGE;
+    }
+}
+
+bitflags! {
+    /// Optional CPU features to advertise when compiling a database with an
+    /// explicit [`Platform`]. These mirror the `HS_CPU_FEATURES_*` flags in
+    /// the Hyperscan C API and are advisory: setting a feature here tells
+    /// Hyperscan it may emit code paths that require it, which means the
+    /// resulting database will fail to deserialize on a CPU that lacks it.
+    ///
+    /// For maximum portability, leave this empty (or use [`Platform::generic`]).
+    #[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
+    pub struct CpuFeatures: c_ulonglong {
+        const AVX2 = hs::HS_CPU_FEATURES_AVX2 as c_ulonglong;
+        const AVX512 = hs::HS_CPU_FEATURES_AVX512 as c_ulonglong;
+        const AVX512VBMI = hs::HS_CPU_FEATURES_AVX512VBMI as c_ulonglong;
+    }
+}
+
+/// Tuning hint for the host microarchitecture, mirroring `HS_TUNE_FAMILY_*`.
+///
+/// This guides Hyperscan's optimisation choices but does not gate
+/// deserialization: a database tuned for one family will still load on a
+/// different family with the same CPU feature set.
+#[non_exhaustive]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[repr(u32)]
+pub enum Tune {
+    #[default]
+    Generic = hs::HS_TUNE_FAMILY_GENERIC,
+    SandyBridge = hs::HS_TUNE_FAMILY_SNB,
+    IvyBridge = hs::HS_TUNE_FAMILY_IVB,
+    Haswell = hs::HS_TUNE_FAMILY_HSW,
+    Silvermont = hs::HS_TUNE_FAMILY_SLM,
+    Broadwell = hs::HS_TUNE_FAMILY_BDW,
+    Skylake = hs::HS_TUNE_FAMILY_SKL,
+    SkylakeServer = hs::HS_TUNE_FAMILY_SKX,
+    Goldmont = hs::HS_TUNE_FAMILY_GLM,
+    IceLake = hs::HS_TUNE_FAMILY_ICL,
+    IceLakeServer = hs::HS_TUNE_FAMILY_ICX,
+}
+
+/// Target platform descriptor passed to the database compile calls.
+///
+/// Hyperscan databases compiled with the default (`null`) platform inherit the
+/// build host's CPU features via `hs_populate_platform`, so a database built on
+/// an AVX2-capable host will refuse to deserialize on a CPU without AVX2. To
+/// produce a portable database, pass [`Platform::generic`] (no CPU features
+/// advertised); to faithfully reproduce default behaviour, pass
+/// [`Platform::native`].
+///
+/// Construct with a builder pattern: `Platform::generic().with_tune(Tune::Skylake)`.
+#[derive(Clone, Copy, Debug)]
+pub struct Platform {
+    inner: hs::hs_platform_info_t,
+}
+
+impl Platform {
+    /// A baseline platform: generic tuning, no optional CPU features
+    /// advertised. The resulting database is portable to any CPU supporting
+    /// Hyperscan's mandatory ISA baseline (SSE4.2 on x86_64, NEON on aarch64).
+    pub fn generic() -> Self {
+        Self {
+            inner: hs::hs_platform_info_t {
+                tune: hs::HS_TUNE_FAMILY_GENERIC,
+                cpu_features: 0,
+                reserved1: 0,
+                reserved2: 0,
+            },
+        }
+    }
+
+    /// Populate from the running host's CPU features via
+    /// `hs_populate_platform`. Equivalent to passing `null` to the underlying
+    /// compile call; useful when you want an explicit record of what was
+    /// targeted, or as a starting point for further customisation.
+    pub fn native() -> Result<Self, Error> {
+        let mut info = MaybeUninit::<hs::hs_platform_info_t>::zeroed();
+        unsafe {
+            hs::hs_populate_platform(info.as_mut_ptr())
+                .ok()
+                .map(|()| Self {
+                    inner: info.assume_init(),
+                })
+        }
+    }
+
+    pub fn with_tune(mut self, tune: Tune) -> Self {
+        self.inner.tune = tune as u32;
+        self
+    }
+
+    pub fn with_cpu_features(mut self, features: CpuFeatures) -> Self {
+        self.inner.cpu_features = features.bits();
+        self
+    }
+
+    pub fn cpu_features(&self) -> CpuFeatures {
+        CpuFeatures::from_bits_truncate(self.inner.cpu_features)
+    }
+
+    /// Returns the raw `HS_TUNE_FAMILY_*` constant; use [`Self::cpu_features`]
+    /// for the typed feature set.
+    pub fn tune_raw(&self) -> u32 {
+        self.inner.tune
+    }
+}
+
+impl Default for Platform {
+    fn default() -> Self {
+        Self::generic()
     }
 }

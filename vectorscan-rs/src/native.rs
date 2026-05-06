@@ -3,7 +3,7 @@ use std::ffi::{c_int, c_uint, c_ulonglong, c_void};
 use std::mem::MaybeUninit;
 use vectorscan_rs_sys as hs;
 
-use super::{wrapper, AsResult, Error, HyperscanErrorCode, Pattern, ScanMode};
+use super::{wrapper, AsResult, Error, HyperscanErrorCode, Pattern, Platform, ScanMode};
 
 // -------------------------------------------------------------------------------------------------
 // Scan Callback
@@ -31,6 +31,17 @@ impl BlockDatabase {
     /// Create a new database with the given patterns
     pub fn new(patterns: Vec<Pattern>) -> Result<Self, Error> {
         let inner = wrapper::Database::new(patterns, ScanMode::BLOCK)?;
+        Ok(Self { inner })
+    }
+
+    /// Create a new database targeting the given [`Platform`].
+    ///
+    /// Use [`Platform::generic`] to produce a database that deserializes on
+    /// any CPU supporting Hyperscan's baseline ISA, at the cost of forgoing
+    /// CPU-specific code paths the build host might support.
+    pub fn with_platform(patterns: Vec<Pattern>, platform: &Platform) -> Result<Self, Error> {
+        let inner =
+            wrapper::Database::new_with_platform(patterns, ScanMode::BLOCK, Some(platform))?;
         Ok(Self { inner })
     }
 
@@ -122,6 +133,15 @@ impl StreamingDatabase {
     /// Create a new database with the given patterns
     pub fn new(patterns: Vec<Pattern>) -> Result<Self, Error> {
         let inner = wrapper::Database::new(patterns, ScanMode::STREAM)?;
+        Ok(Self { inner })
+    }
+
+    /// Create a new streaming database targeting the given [`Platform`].
+    ///
+    /// See [`BlockDatabase::with_platform`] for portability semantics.
+    pub fn with_platform(patterns: Vec<Pattern>, platform: &Platform) -> Result<Self, Error> {
+        let inner =
+            wrapper::Database::new_with_platform(patterns, ScanMode::STREAM, Some(platform))?;
         Ok(Self { inner })
     }
 
