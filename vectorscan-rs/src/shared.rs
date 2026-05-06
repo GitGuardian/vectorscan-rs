@@ -7,7 +7,7 @@ use std::sync::Arc;
 use vectorscan_rs_sys as hs;
 
 use super::native::{on_match_trampoline, Context, Scan};
-use super::{wrapper, AsResult, Error, HyperscanErrorCode, Pattern, ScanMode};
+use super::{wrapper, AsResult, Error, HyperscanErrorCode, Pattern, Platform, ScanMode};
 
 /// A block-mode database whose compiled data is reference-counted with [`Arc`]
 /// and can be shared across threads or stored in structs avoiding self-referential problems.
@@ -20,6 +20,21 @@ impl SharedBlockDatabase {
     /// Create a new database with the given patterns
     pub fn new(patterns: Vec<Pattern>) -> Result<Self, Error> {
         let inner = wrapper::Database::new(patterns, ScanMode::BLOCK)?;
+        Ok(Self {
+            inner: Arc::new(inner),
+        })
+    }
+
+    /// Create a new shared database targeting the given [`Platform`].
+    ///
+    /// Use [`Platform::generic`] to produce a database whose serialized bytes
+    /// can be deserialized on any CPU supporting Hyperscan's baseline ISA.
+    /// The default constructor (`new`) inherits the build host's CPU features
+    /// via `hs_populate_platform`, which is faster but ties the serialized
+    /// database to the host's feature set.
+    pub fn with_platform(patterns: Vec<Pattern>, platform: &Platform) -> Result<Self, Error> {
+        let inner =
+            wrapper::Database::new_with_platform(patterns, ScanMode::BLOCK, Some(platform))?;
         Ok(Self {
             inner: Arc::new(inner),
         })
@@ -236,6 +251,29 @@ mod tests {
             Scan::Continue
         })?;
         assert_eq!(matches.as_slice(), &[(0, 0, 5, 0), (42, 0, 11, 0)]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn portable_shared_db_serialize_roundtrip() -> Result<(), Error> {
+        // GIVEN a SharedBlockDatabase compiled against the baseline platform
+        let patterns = vec![Pattern::new(b"needle".to_vec(), Flag::default(), None)];
+        let plat = crate::Platform::generic();
+        let db = SharedBlockDatabase::with_platform(patterns, &plat)?;
+
+        // WHEN serialized and deserialized
+        let bytes = db.serialize()?;
+        let db2 = SharedBlockDatabase::deserialize(&bytes)?;
+
+        // THEN the round-tripped database scans correctly
+        let mut scanner = db2.create_scanner()?;
+        let mut hits = 0;
+        scanner.scan(b"find the needle", |_, _, _, _| {
+            hits += 1;
+            Scan::Continue
+        })?;
+        assert_eq!(hits, 1);
 
         Ok(())
     }

@@ -9,7 +9,7 @@ mod wrapper;
 
 pub use error::{AsResult, Error, HyperscanErrorCode};
 pub use native::*;
-pub use wrapper::{Flag, Pattern, ScanMode, Scratch};
+pub use wrapper::{CpuFeatures, Flag, Pattern, Platform, ScanMode, Scratch, Tune};
 
 #[cfg(test)]
 mod tests {
@@ -197,6 +197,69 @@ mod tests {
 
         assert_eq!(match_count, 2); // Should stop after 2 matches
         Ok(())
+    }
+
+    #[test]
+    fn portable_db_compiles_and_scans() -> Result<(), Error> {
+        // GIVEN a baseline (generic) platform descriptor
+        let patterns = vec![Pattern::new(b"hello".to_vec(), Flag::default(), None)];
+        let plat = Platform::generic();
+
+        // WHEN compiling a BlockDatabase against that platform
+        let db = BlockDatabase::with_platform(patterns, &plat)?;
+        let mut scanner = BlockScanner::new(&db)?;
+
+        // THEN it scans correctly
+        let mut matches = Vec::new();
+        scanner.scan(b"say hello world", |id, from, to, flags| {
+            matches.push((id, from, to, flags));
+            Scan::Continue
+        })?;
+        assert_eq!(matches.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn native_platform_round_trips() -> Result<(), Error> {
+        // GIVEN a platform populated from the running host
+        let plat = Platform::native()?;
+
+        // WHEN compiling a database against it
+        let patterns = vec![Pattern::new(b"hello".to_vec(), Flag::default(), None)];
+        let _db = BlockDatabase::with_platform(patterns, &plat)?;
+
+        // THEN compilation succeeds (the populated values are accepted by hyperscan)
+        Ok(())
+    }
+
+    #[test]
+    fn portable_db_serializes_and_deserializes() -> Result<(), Error> {
+        // GIVEN a baseline-targeted database serialized to bytes
+        let patterns = vec![Pattern::new(b"hello".to_vec(), Flag::default(), None)];
+        let plat = Platform::generic();
+        let db = wrapper::Database::new_with_platform(patterns, ScanMode::BLOCK, Some(&plat))?;
+        let serialized = db.serialize()?;
+        let bytes = serialized.as_bytes().to_vec();
+
+        // WHEN deserializing
+        let db2 = wrapper::Database::deserialize_from_bytes(&bytes)?;
+
+        // THEN sizes match and the round-tripped database is usable
+        assert_eq!(db.size()?, db2.size()?);
+        Ok(())
+    }
+
+    #[test]
+    fn platform_builder_round_trip() {
+        // GIVEN a platform built with explicit cpu features and tuning
+        let p = Platform::generic()
+            .with_tune(Tune::Skylake)
+            .with_cpu_features(CpuFeatures::AVX2 | CpuFeatures::AVX512);
+
+        // THEN the accessors return what was set
+        assert_eq!(p.tune_raw(), Tune::Skylake as u32);
+        assert!(p.cpu_features().contains(CpuFeatures::AVX2));
+        assert!(p.cpu_features().contains(CpuFeatures::AVX512));
     }
 
     #[test]
