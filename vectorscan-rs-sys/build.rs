@@ -13,8 +13,17 @@ fn main() {
 
     let manifest_dir = PathBuf::from(env("CARGO_MANIFEST_DIR"));
     let out_dir = PathBuf::from(env("OUT_DIR"));
+    let target = env("TARGET");
+    let target_env = target.replace('-', "_");
 
-    let include_dir = out_dir
+    // If `VECTORSCAN_PREBUILT_DIR_<target>` is set, link against it
+    let prebuilt_env_var = format!("VECTORSCAN_PREBUILT_DIR_{target_env}");
+    println!("cargo:rerun-if-env-changed={prebuilt_env_var}");
+    let prebuilt_dir = std::env::var_os(&prebuilt_env_var).map(PathBuf::from);
+
+    let include_dir = prebuilt_dir
+        .as_ref()
+        .unwrap_or(&out_dir)
         .join("include")
         .into_os_string()
         .into_string()
@@ -27,7 +36,6 @@ fn main() {
     // Order matters here: c++ depends on c++abi, which depends on unwind. Static linking
     // requires emitting the dependencies after their dependents.
     {
-        let target = env("TARGET");
         if target.contains("windows-gnullvm") {
             // llvm-mingw: clang + libc++ + libc++abi + libunwind. Statically link all three
             // so the resulting binary has no libc++.dll / libunwind.dll runtime dependency.
@@ -38,7 +46,7 @@ fn main() {
             // Match the `cc` crate's precedence: target-specific CXX_<target> wins over
             // a generic CXX, which would otherwise be wrong on hosts that set CXX=g++
             // globally (common on Ubuntu via direnv/CI).
-            let cxx = std::env::var(format!("CXX_{}", target.replace('-', "_")))
+            let cxx = std::env::var(format!("CXX_{target_env}"))
                 .or_else(|_| std::env::var("CXX"))
                 .unwrap_or_else(|_| "clang++".to_string());
             let path = Command::new(&cxx)
@@ -79,11 +87,13 @@ fn main() {
         }
     }
 
-    let vectorscan_src_dir = manifest_dir.join("vectorscan");
-
-    // Build with cmake
-    {
-        let mut cfg = cmake::Config::new(&vectorscan_src_dir);
+    let dst = if let Some(prebuilt_dir) = &prebuilt_dir {
+        // relink if the prebuilt lib changes in place
+        println!("cargo:rerun-if-changed={}", prebuilt_dir.display());
+        prebuilt_dir.clone()
+    } else {
+        // Build with cmake
+        let mut cfg = cmake::Config::new(manifest_dir.join("vectorscan"));
 
         macro_rules! cfg_define_feature {
             ($cmake_feature: tt, $cargo_feature: tt) => {
@@ -186,21 +196,23 @@ fn main() {
 
         let dst = cfg.build();
 
-        println!("cargo:rustc-link-lib=static=hs");
-        println!("cargo:rustc-link-search={}", dst.join("lib").display());
-        println!("cargo:rustc-link-search={}", dst.join("lib64").display());
-    }
-
-    // Run hyperscan unit test suite
-    #[cfg(feature = "unit_hyperscan")]
-    {
-        let unittests = out_dir.join("build").join("bin").join("unit-hyperscan");
-        match Command::new(unittests).status() {
-            Ok(rc) if rc.success() => {}
-            Ok(rc) => panic!("Failed to run unit tests: exit with code {rc}"),
-            Err(e) => panic!("Failed to run unit tests: {e}"),
+        // Run hyperscan unit test suite
+        #[cfg(feature = "unit_hyperscan")]
+        {
+            let unittests = out_dir.join("build").join("bin").join("unit-hyperscan");
+            match Command::new(unittests).status() {
+                Ok(rc) if rc.success() => {}
+                Ok(rc) => panic!("Failed to run unit tests: exit with code {rc}"),
+                Err(e) => panic!("Failed to run unit tests: {e}"),
+            }
         }
-    }
+
+        dst
+    };
+
+    println!("cargo:rustc-link-lib=static=hs");
+    println!("cargo:rustc-link-search={}", dst.join("lib").display());
+    println!("cargo:rustc-link-search={}", dst.join("lib64").display());
 
     // Run bindgen if needed, or else use the pre-generated bindings
     #[cfg(feature = "bindgen")]

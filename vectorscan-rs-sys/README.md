@@ -13,6 +13,15 @@ This crate builds a vendored copy of Vectorscan from source.
 
 This has been tested on x86_64 Linux, x86_64 macOS, and aarch64 macOS.
 
+### Using a prebuilt vectorscan library
+
+To link a prebuilt static library instead, set `VECTORSCAN_PREBUILT_DIR_<target>` to a directory holding `lib/libhs.a` (or `lib64/libhs.a`), e.g. `VECTORSCAN_PREBUILT_DIR_x86_64_unknown_linux_gnu`.
+The library must come from the same Vectorscan sources and build options as this crate.
+
+Notes:
+- The `simd_specialization`, `cpu_native`, `asan` and `unit_hyperscan` features have no effect in this mode.
+- With the `gen` feature enabled, the prebuilt dir also needs the public headers in `include/hs`.
+
 
 ## Implementation Notes
 This crate was originally written as part of [Nosey Parker](https://github.com/praetorian-inc/noseyparker).
